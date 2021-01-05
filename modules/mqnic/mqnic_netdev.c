@@ -65,11 +65,13 @@ static int mqnic_start_port(struct net_device *ndev)
     // set up RX queues
     for (k = 0; k < priv->rx_queue_count; k++)
     {
+        // allocate twice the amount of memory needed for page recycling
+        u32 min_rx_buffer_sz = (ndev->mtu+ETH_HLEN)*2;
         priv->rx_ring[k]->mtu = ndev->mtu;
-        if (ndev->mtu+ETH_HLEN <= PAGE_SIZE)
+        if (min_rx_buffer_sz <= PAGE_SIZE)
             priv->rx_ring[k]->page_order = 0;
         else
-            priv->rx_ring[k]->page_order = ilog2((ndev->mtu+ETH_HLEN+PAGE_SIZE-1)/PAGE_SIZE-1)+1;
+            priv->rx_ring[k]->page_order = ilog2((min_rx_buffer_sz+PAGE_SIZE-1)/PAGE_SIZE-1)+1;
         mqnic_activate_rx_ring(priv, priv->rx_ring[k], k);
     }
 

@@ -198,36 +198,45 @@ int mqnic_free_rx_buf(struct mqnic_priv *priv, struct mqnic_ring *ring)
     return cnt;
 }
 
-int mqnic_prepare_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring, int index)
+static int mqnic_alloc_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring)
+{
+    // TODO: What if we ran out of descriptors?
+    u32 ret = ring->head_ptr & ring->size_mask;
+    ring->head_ptr++;
+    return ret;
+}
+
+int mqnic_prepare_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring, int index, struct page *page, unsigned int page_offset)
 {
     struct mqnic_rx_info *rx_info = &ring->rx_info[index];
     struct mqnic_desc *rx_desc = (struct mqnic_desc *)(ring->buf + index*ring->stride);
-    struct page *page = rx_info->page;
     u32 page_order = ring->page_order;
     u32 len = PAGE_SIZE << page_order;
     dma_addr_t dma_addr;
 
-    if (unlikely(page))
+    if (unlikely(rx_info->page))
     {
         dev_err(priv->dev, "mqnic_prepare_rx_desc skb not yet processed on port %d", priv->port);
         return -1;
     }
 
-    page = dev_alloc_pages(page_order);
-    if (unlikely(!page))
-    {
-        dev_err(priv->dev, "mqnic_prepare_rx_desc failed to allocate memory on port %d", priv->port);
-        return -1;
-    }
-
-    // map page
-    dma_addr = dma_map_page(priv->dev, page, 0, len, PCI_DMA_FROMDEVICE);
-
-    if (unlikely(dma_mapping_error(priv->dev, dma_addr)))
-    {
-        dev_err(priv->dev, "mqnic_prepare_rx_desc DMA mapping failed on port %d", priv->port);
-        __free_pages(page, page_order);
-        return -1;
+    if (!page) {
+        page = dev_alloc_pages(page_order);
+        if (unlikely(!page))
+        {
+            dev_err(priv->dev, "mqnic_prepare_rx_desc failed to allocate memory on port %d", priv->port);
+            return -1;
+        }
+       
+        // map page
+        dma_addr = dma_map_page(priv->dev, page, 0, len, PCI_DMA_FROMDEVICE);
+       
+        if (unlikely(dma_mapping_error(priv->dev, dma_addr)))
+        {
+            dev_err(priv->dev, "mqnic_prepare_rx_desc DMA mapping failed on port %d", priv->port);
+            __free_pages(page, page_order);
+            return -1;
+        }
     }
 
     // write descriptor
@@ -253,7 +262,7 @@ void mqnic_refill_rx_buffers(struct mqnic_priv *priv, struct mqnic_ring *ring)
 
     for ( ; missing-- > 0; )
     {
-        if (mqnic_prepare_rx_desc(priv, ring, ring->head_ptr & ring->size_mask))
+        if (mqnic_prepare_rx_desc(priv, ring, ring->head_ptr & ring->size_mask, NULL, 0))
             break;
         ring->head_ptr++;
     }
@@ -261,6 +270,34 @@ void mqnic_refill_rx_buffers(struct mqnic_priv *priv, struct mqnic_ring *ring)
     // enqueue on NIC
     dma_wmb();
     mqnic_rx_write_head_ptr(ring);
+}
+
+#define PAGE_RECYCLING 1
+
+/* Returns the available RX buffer size. This is half of the allocated page
+   size because we use page flipping.  */
+static unsigned int mqnic_rx_buffer_size(struct mqnic_rx_info *rx_info)
+{
+#ifdef PAGE_RECYCLING
+#if (PAGE_SIZE < 8192)
+    return rx_info->len / 2;
+#else
+#error Not supported.
+#endif
+#else
+    return rx_info->len;
+#endif
+}
+
+static void mqnic_flip_rx_buffer(struct mqnic_rx_info *rx_info)
+{
+#ifdef PAGE_RECYCLING
+#if (PAGE_SIZE < 8192)
+    rx_info->page_offset ^= mqnic_rx_buffer_size(rx_info);
+#else
+#error Not supported.
+#endif
+#endif
 }
 
 static struct mqnic_rx_info *mqnic_get_rx_buffer(struct mqnic_ring *ring, struct mqnic_priv *priv, u32 ring_index)
@@ -272,9 +309,39 @@ static struct mqnic_rx_info *mqnic_get_rx_buffer(struct mqnic_ring *ring, struct
     return rx_info;
 }
 
-static void mqnic_put_rx_buffer(struct mqnic_priv *priv, struct mqnic_rx_info *rx_info)
+/* Add half of a RX page back to the ring. Please note that the function
+   increases the page reference count by one so that when the SKB of the other
+   part of the RX page is consumed, the page will not be free'd with the call
+   to page_put().  */
+static void mqnic_reuse_rx_page(struct mqnic_ring *ring, struct mqnic_priv *priv, struct mqnic_rx_info *rx_info)
 {
-    dma_unmap_page(priv->dev, dma_unmap_addr(rx_info, dma_addr), dma_unmap_len(rx_info, len), PCI_DMA_FROMDEVICE);
+    u32 idx;
+
+    page_ref_add(rx_info->page, 1);
+
+    idx = mqnic_alloc_rx_desc(priv, ring);
+
+    mqnic_prepare_rx_desc(priv, ring, idx, rx_info->page, rx_info->page_offset);
+}
+
+static bool mqnic_can_reuse_rx_page(struct mqnic_rx_info *rx_info)
+{
+#ifndef PAGE_RECYCLING
+    return false;
+#else
+    /* TODO: What other reasons are there to not reuse the RX page? */
+
+    return page_ref_count(rx_info->page) == 1;
+#endif
+}
+
+static void mqnic_put_rx_buffer(struct mqnic_ring *ring, struct mqnic_priv *priv, struct mqnic_rx_info *rx_info)
+{
+    if (mqnic_can_reuse_rx_page(rx_info)) {
+        mqnic_reuse_rx_page(ring, priv, rx_info);
+    } else {
+        dma_unmap_page(priv->dev, dma_unmap_addr(rx_info, dma_addr), dma_unmap_len(rx_info, len), PCI_DMA_FROMDEVICE);
+    }
     rx_info->dma_addr = 0;
 
     rx_info->page = NULL;
@@ -291,7 +358,9 @@ static void mqnic_add_rx_frag(struct mqnic_rx_info *rx_info, struct sk_buff *skb
     skb_shinfo(skb)->nr_frags = 1;
     skb->len = len;
     skb->data_len = len;
-    skb->truesize += rx_info->len;
+    skb->truesize += mqnic_rx_buffer_size(rx_info);
+
+    mqnic_flip_rx_buffer(rx_info);
 }
 
 int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, int napi_budget)
@@ -362,7 +431,7 @@ int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, 
 
         mqnic_add_rx_frag(rx_info, skb, len);
 
-        mqnic_put_rx_buffer(priv, rx_info);
+        mqnic_put_rx_buffer(ring, priv, rx_info);
 
         // hand off SKB
         napi_gro_frags(&cq_ring->napi);

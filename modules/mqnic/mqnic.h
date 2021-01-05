@@ -376,7 +376,7 @@ void mqnic_rx_read_tail_ptr(struct mqnic_ring *ring);
 void mqnic_rx_write_head_ptr(struct mqnic_ring *ring);
 void mqnic_free_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring, int index);
 int mqnic_free_rx_buf(struct mqnic_priv *priv, struct mqnic_ring *ring);
-int mqnic_prepare_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring, int index);
+int mqnic_prepare_rx_desc(struct mqnic_priv *priv, struct mqnic_ring *ring, int index, struct page *page, unsigned int page_offset);
 void mqnic_refill_rx_buffers(struct mqnic_priv *priv, struct mqnic_ring *ring);
 int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, int napi_budget);
 void mqnic_rx_irq(struct mqnic_cq_ring *cq);
