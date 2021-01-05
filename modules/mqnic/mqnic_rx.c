@@ -263,6 +263,37 @@ void mqnic_refill_rx_buffers(struct mqnic_priv *priv, struct mqnic_ring *ring)
     mqnic_rx_write_head_ptr(ring);
 }
 
+static struct mqnic_rx_info *mqnic_get_rx_buffer(struct mqnic_ring *ring, struct mqnic_priv *priv, u32 ring_index)
+{
+    struct mqnic_rx_info *rx_info = &ring->rx_info[ring_index];
+
+    dma_sync_single_range_for_cpu(priv->dev, rx_info->dma_addr, rx_info->page_offset, rx_info->len, PCI_DMA_FROMDEVICE);
+
+    return rx_info;
+}
+
+static void mqnic_put_rx_buffer(struct mqnic_priv *priv, struct mqnic_rx_info *rx_info)
+{
+    dma_unmap_page(priv->dev, dma_unmap_addr(rx_info, dma_addr), dma_unmap_len(rx_info, len), PCI_DMA_FROMDEVICE);
+    rx_info->dma_addr = 0;
+
+    rx_info->page = NULL;
+}
+
+static void mqnic_add_rx_frag(struct mqnic_rx_info *rx_info, struct sk_buff *skb, u32 len)
+{
+    struct page *page;
+
+    page = rx_info->page;
+
+    __skb_fill_page_desc(skb, 0, page, rx_info->page_offset, len);
+
+    skb_shinfo(skb)->nr_frags = 1;
+    skb->len = len;
+    skb->data_len = len;
+    skb->truesize += rx_info->len;
+}
+
 int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, int napi_budget)
 {
     struct mqnic_priv *priv = netdev_priv(ndev);
@@ -270,7 +301,6 @@ int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, 
     struct mqnic_rx_info *rx_info;
     struct mqnic_cpl *cpl;
     struct sk_buff *skb;
-    struct page *page;
     u32 cq_index;
     u32 cq_tail_ptr;
     u32 ring_index;
@@ -297,15 +327,6 @@ int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, 
     {
         cpl = (struct mqnic_cpl *)(cq_ring->buf + cq_index*cq_ring->stride);
         ring_index = cpl->index & ring->size_mask;
-        rx_info = &ring->rx_info[ring_index];
-        page = rx_info->page;
-
-        if (unlikely(!page))
-        {
-            dev_err(priv->dev, "mqnic_process_rx_cq ring %d null page at index %d", cq_ring->ring_index, ring_index);
-            print_hex_dump(KERN_ERR, "", DUMP_PREFIX_NONE, 16, 1, cpl, MQNIC_CPL_SIZE, true);
-            break;
-        }
 
         skb = napi_get_frags(&cq_ring->napi);
         if (unlikely(!skb))
@@ -329,21 +350,19 @@ int mqnic_process_rx_cq(struct net_device *ndev, struct mqnic_cq_ring *cq_ring, 
             skb->ip_summed = CHECKSUM_COMPLETE;
         }
 
-        // unmap
-        dma_unmap_page(priv->dev, dma_unmap_addr(rx_info, dma_addr), dma_unmap_len(rx_info, len), PCI_DMA_FROMDEVICE);
-        rx_info->dma_addr = 0;
+        rx_info = mqnic_get_rx_buffer(ring, priv, ring_index);
+        if (unlikely(!rx_info->page))
+        {
+            dev_err(priv->dev, "mqnic_process_rx_cq ring %d null page at index %d", cq_ring->ring_index, ring_index);
+            print_hex_dump(KERN_ERR, "", DUMP_PREFIX_NONE, 16, 1, cpl, MQNIC_CPL_SIZE, true);
+            break;
+        }
 
         len = min_t(u32, cpl->len, rx_info->len);
 
-        dma_sync_single_range_for_cpu(priv->dev, rx_info->dma_addr, rx_info->page_offset, rx_info->len, PCI_DMA_FROMDEVICE);
+        mqnic_add_rx_frag(rx_info, skb, len);
 
-        __skb_fill_page_desc(skb, 0, page, rx_info->page_offset, len);
-        rx_info->page = NULL;
-
-        skb_shinfo(skb)->nr_frags = 1;
-        skb->len = len;
-        skb->data_len = len;
-        skb->truesize += rx_info->len;
+        mqnic_put_rx_buffer(priv, rx_info);
 
         // hand off SKB
         napi_gro_frags(&cq_ring->napi);
